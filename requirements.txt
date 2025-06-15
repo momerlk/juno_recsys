@@ -1,0 +1,3 @@
+tensorflow==2.12.0
+tensorFlow-datasets==4.9.2
+tensorFlow-recommenders==0.7.3
