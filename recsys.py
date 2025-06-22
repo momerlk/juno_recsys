@@ -10,11 +10,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import warnings
 import pickle
 import os
+from datetime import datetime, timedelta
 
 warnings.filterwarnings('ignore')
 
 class ColdStartRecommendationSystem:
-    def __init__(self, mongo_uri="mongodb://localhost:27017/", db_name="juno_db"):
+    def __init__(self, mongo_uri="mongodb://localhost:27017/", db_name="juno_db",
+                 freshness_weight=0.2, diversity_weight=0.3, recency_weight=0.1):
         """
         Initialize the recommendation system.
         The MongoDB client is initialized on-demand and excluded from pickling.
@@ -24,6 +26,11 @@ class ColdStartRecommendationSystem:
         self.client = None
         self.db = None
         
+        # --- Weights for recommendation quality ---
+        self.freshness_weight = freshness_weight
+        self.diversity_weight = diversity_weight
+        self.recency_weight = recency_weight # For future use or advanced scenarios
+
         # DataFrames
         self.users_df = None
         self.products_df = None
@@ -46,16 +53,13 @@ class ColdStartRecommendationSystem:
             print("Establishing MongoDB connection...")
             self.client = MongoClient(self.mongo_uri, unicode_decode_error_handler='ignore')
             self.db = self.client[self.db_name]
+            print("MongoDB connection established.")
 
     def __getstate__(self):
         """
         Prepare the object's state for pickling.
-        
-        This method is called by pickle.dump(). We exclude the non-serializable
-        MongoDB client and database objects.
         """
         state = self.__dict__.copy()
-        # Remove the unpickleable entries.
         del state['client']
         del state['db']
         return state
@@ -63,12 +67,8 @@ class ColdStartRecommendationSystem:
     def __setstate__(self, state):
         """
         Restore the object's state from a pickled state.
-        
-        This method is called by pickle.load(). We restore the attributes
-        and then re-initialize the MongoDB connection.
         """
         self.__dict__.update(state)
-        # Re-initialize the MongoDB connection after unpickling.
         self.client = None 
         self.db = None
 
@@ -108,7 +108,8 @@ class ColdStartRecommendationSystem:
                 'rating': product.get('rating', 0),
                 'review_count': product.get('review_count', 0),
                 'is_trending': product.get('is_trending', False),
-                'is_featured': product.get('is_featured', False)
+                'is_featured': product.get('is_featured', False),
+                'created_at': product.get('createdAt', datetime.now() - timedelta(days=365)) # For freshness
             })
 
         interactions_cursor = self.db['interactions'].find({})
@@ -123,13 +124,17 @@ class ColdStartRecommendationSystem:
                 'user_id': interaction['user_id'],
                 'product_id': interaction['product_id'],
                 'rating': rating,
-                'action_type': action_type
+                'action_type': action_type,
+                'timestamp': interaction.get('timestamp', datetime.now() - timedelta(days=365)) # For recency
             })
 
         self.users_df = pd.DataFrame(users_data)
         self.products_df = pd.DataFrame(products_data)
         self.interactions_df = pd.DataFrame(interactions_data)
         
+        # Convert created_at to datetime
+        self.products_df['created_at'] = pd.to_datetime(self.products_df['created_at'])
+
         print(f"Loaded {len(self.users_df)} users, {len(self.products_df)} products, {len(self.interactions_df)} interactions")
 
     def prepare_user_features(self):
@@ -244,15 +249,62 @@ class ColdStartRecommendationSystem:
         print("Loading complete.")
         return system
 
+    def _get_realtime_user_interactions(self, user_id):
+        """Fetch the latest interactions for a user from MongoDB."""
+        self._connect_mongo()
+        user_interactions_cursor = self.db['interactions'].find({'user_id': user_id})
+        return [interaction['product_id'] for interaction in user_interactions_cursor]
+        
+    def _apply_reranking(self, recommendations, num_recommendations):
+        """Re-rank recommendations based on freshness and diversity."""
+        # Normalize scores
+        max_score = max(score for _, score in recommendations)
+        recommendations = [(item_id, score / max_score) for item_id, score in recommendations]
+        
+        final_recommendations = []
+        
+        for item_id, score in recommendations:
+            product_info = self.products_df.loc[self.products_df['product_id'] == item_id]
+            if product_info.empty:
+                continue
+
+            # --- Freshness Score ---
+            days_since_creation = (datetime.now() - product_info.iloc[0]['created_at']).days
+            freshness_score = max(0, 1 - (days_since_creation / 365)) # Simple linear decay over a year
+
+            # --- Diversity Score ---
+            product_categories = set(product_info.iloc[0]['categories'].split(','))
+            diversity_penalty = 0
+            for rec_item_id, _ in final_recommendations:
+                rec_item_info = self.products_df.loc[self.products_df['product_id'] == rec_item_id]
+                rec_item_categories = set(rec_item_info.iloc[0]['categories'].split(','))
+                
+                # Penalize if categories overlap
+                if product_categories.intersection(rec_item_categories):
+                    diversity_penalty += 0.1 
+
+            diversity_score = 1 - diversity_penalty
+            
+            # --- Combined Score ---
+            combined_score = (1 - self.freshness_weight - self.diversity_weight) * score \
+                           + self.freshness_weight * freshness_score \
+                           + self.diversity_weight * diversity_score
+                           
+            final_recommendations.append((item_id, combined_score))
+        
+        # Sort by the new combined score
+        final_recommendations.sort(key=lambda x: x[1], reverse=True)
+        return final_recommendations[:num_recommendations]
+
     def get_recommendations(self, user_id, num_recommendations=10):
-        """Get recommendations for a user (handles cold start)."""
+        """Get recommendations for a user, with real-time updates and re-ranking."""
         if self.model is None:
             raise ValueError("Model not trained or loaded. Please call train_model() or load().")
 
         user_id_map, _, item_id_map, _ = self.dataset.mapping()
         
         if user_id in user_id_map:
-            # Existing user
+            # --- Existing user ---
             user_index = user_id_map[user_id]
             all_item_indices = list(item_id_map.values())
             
@@ -264,19 +316,47 @@ class ColdStartRecommendationSystem:
                 num_threads=4
             )
             
-            user_interactions = self.interactions_df[self.interactions_df['user_id'] == user_id]['product_id'].tolist()
+            # STEP 1: Fetch all of the user's past interactions in real-time.
+            # This includes products they have viewed, liked, purchased, etc.
+            user_interactions = self._get_realtime_user_interactions(user_id)
             
             top_items = sorted(zip(item_id_map.keys(), scores), key=lambda x: x[1], reverse=True)
             
-            recommendations = [(item_id, str(score)) for item_id, score in top_items if item_id not in user_interactions]
-            return recommendations[:num_recommendations]
-        else:
-            # Cold start user: recommend popular and trending items
-            print(f"Cold start for user: {user_id}. Recommending popular items.")
-            popular_items = self.products_df.sort_values(by=['is_trending', 'review_count'], ascending=False)
-            recommendations = list(zip(popular_items['product_id'], popular_items['rating'])) # Use rating as a proxy score
-            return recommendations[:num_recommendations]
+            # STEP 2: Filter out any item the user has already interacted with.
+            # The 'if item_id not in user_interactions' clause ensures seen items are removed.
+            predictions = [(item_id, float(score)) for item_id, score in top_items if item_id not in user_interactions]
 
+            # limiting predictions to top num_recommendations
+            predictions = predictions[:num_recommendations]
+
+
+            # --- Re-ranking for Quality ---
+            # Only the unseen items are passed to the re-ranking step.
+            predictions = self._apply_reranking(predictions, num_recommendations)
+            
+
+            product_ids = [pid for pid, score in predictions]
+
+            # Query the database
+            products_cursor = self.db['products'].find({
+                'id': {'$in': product_ids}
+            })
+
+            # Build clean list (remove _id field)
+            products = []
+            for product in products_cursor:
+                product.pop('_id', None)  # Remove _id if present
+                products.append(product)
+
+            # Return recommended products
+            return products
+        else:
+            # --- Cold start user ---
+            # (Logic for new users remains the same)
+            print(f"Cold start for user: {user_id}. Recommending popular items.")
+            popular_items = self.products_df.sort_values(by=['is_trending', 'review_count', 'created_at'], ascending=[False, False, False])
+            recommendations = list(zip(popular_items['product_id'], popular_items['rating']))
+            return recommendations[:num_recommendations]
 # --- Example Usage ---
 def main():
     MODEL_PATH = 'cold_start_recsys.pkl'

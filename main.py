@@ -159,6 +159,7 @@ def get_recommendations():
     #             'error': 'Product details not available'
     #         })
 
+    print(f"processed /recommendations request succesfully for user_id : {user_id}")
     return jsonify({
         'user_id': user_id,
         'num_products_requested': num_products,
@@ -254,11 +255,11 @@ def get_model_info():
             'model_path': MODEL_PATH
         })
 
+# Initialize on import (so gunicorn will trigger this too)
+load_or_train_model()
+start_scheduler()
 
 if __name__ == '__main__':
-    # Initialize the model and scheduler *before* starting the app
-    load_or_train_model()
-    start_scheduler()
     
     # Run the Flask app
     app.run(host='0.0.0.0', port=PORT, debug=True)
