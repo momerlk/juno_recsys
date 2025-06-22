@@ -31,4 +31,4 @@ COPY . /app/
 EXPOSE 8080
 
 # Command to run the app
-CMD ["gunicorn", "-b", "0.0.0.0:8080", "main:app"]
+CMD ["gunicorn", "-w", "2", "--threads", "2", "-b", "0.0.0.0:8080", "main:app", "--access-logfile", "-", "--error-logfile", "-", "--timeout", "300"]
