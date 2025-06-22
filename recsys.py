@@ -257,9 +257,13 @@ class ColdStartRecommendationSystem:
         
     def _apply_reranking(self, recommendations, num_recommendations):
         """Re-rank recommendations based on freshness and diversity."""
+
+        self._connect_mongo()
+
         # Normalize scores
         max_score = max(score for _, score in recommendations)
-        recommendations = [(item_id, score / max_score) for item_id, score in recommendations]
+        if max_score != 0 : 
+            recommendations = [(item_id, score / max_score) for item_id, score in recommendations]
         
         final_recommendations = []
         
@@ -326,14 +330,19 @@ class ColdStartRecommendationSystem:
             # The 'if item_id not in user_interactions' clause ensures seen items are removed.
             predictions = [(item_id, float(score)) for item_id, score in top_items if item_id not in user_interactions]
 
-            # limiting predictions to top num_recommendations
-            predictions = predictions[:num_recommendations]
-
-
             # --- Re-ranking for Quality ---
             # Only the unseen items are passed to the re-ranking step.
-            predictions = self._apply_reranking(predictions, num_recommendations)
-            
+            to_rerank = len(predictions)
+            if to_rerank > 15 : # small number for performance
+                to_rerank = 15
+            if num_recommendations > to_rerank :
+                to_rerank = num_recommendations
+
+            predictions = self._apply_reranking(predictions[:to_rerank], to_rerank)
+
+
+            # limiting predictions to top num_recommendations
+            predictions = predictions[:num_recommendations]
 
             product_ids = [pid for pid, score in predictions]
 
@@ -355,8 +364,36 @@ class ColdStartRecommendationSystem:
             # (Logic for new users remains the same)
             print(f"Cold start for user: {user_id}. Recommending popular items.")
             popular_items = self.products_df.sort_values(by=['is_trending', 'review_count', 'created_at'], ascending=[False, False, False])
-            recommendations = list(zip(popular_items['product_id'], popular_items['rating']))
-            return recommendations[:num_recommendations]
+            predictions = list(zip(popular_items['product_id'], popular_items['rating']))
+
+            # --- Re-ranking for Quality ---
+            # Only the unseen items are passed to the re-ranking step.
+            to_rerank = len(predictions)
+            if to_rerank > 50 : # large number for new users
+                to_rerank = 50
+            if num_recommendations > to_rerank :
+                to_rerank = num_recommendations
+
+            predictions = self._apply_reranking(predictions[:to_rerank], to_rerank)
+            predictions = predictions[:num_recommendations]
+
+            product_ids = [pid for pid, score in predictions]
+
+            # Query the database
+            products_cursor = self.db['products'].find({
+                'id': {'$in': product_ids}
+            })
+
+            # Build clean list (remove _id field)
+            products = []
+            for product in products_cursor:
+                product.pop('_id', None)  # Remove _id if present
+                products.append(product)
+
+            # Return recommended products
+            return products
+
+
 # --- Example Usage ---
 def main():
     MODEL_PATH = 'cold_start_recsys.pkl'
