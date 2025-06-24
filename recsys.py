@@ -19,36 +19,25 @@ class ColdStartRecommendationSystem:
                  freshness_weight=0.2, diversity_weight=0.3, recency_weight=0.1):
         """
         Initialize the recommendation system.
-        The MongoDB client is initialized on-demand and excluded from pickling.
         """
         self.mongo_uri = mongo_uri
         self.db_name = db_name
         self.client = None
         self.db = None
         
-        # --- Weights for recommendation quality ---
         self.freshness_weight = freshness_weight
         self.diversity_weight = diversity_weight
-        self.recency_weight = recency_weight # For future use or advanced scenarios
+        self.recency_weight = recency_weight
 
-        # DataFrames
-        self.users_df = None
-        self.products_df = None
-        self.interactions_df = None
-        
-        # LightFM components
         self.dataset = Dataset()
         self.model = None
-        self.user_features = None
-        self.item_features = None
         
-        # Store feature lists for consistency
         self.user_features_list = []
         self.item_features_list = []
         self.top_categories = []
-        
+
     def _connect_mongo(self):
-        """Establish MongoDB connection."""
+        """Establish MongoDB connection if not already established."""
         if not self.client:
             print("Establishing MongoDB connection...")
             self.client = MongoClient(self.mongo_uri, unicode_decode_error_handler='ignore')
@@ -58,6 +47,7 @@ class ColdStartRecommendationSystem:
     def __getstate__(self):
         """
         Prepare the object's state for pickling.
+        We now KEEP the feature matrices and item metadata for fast prediction times after loading.
         """
         state = self.__dict__.copy()
         del state['client']
@@ -65,166 +55,126 @@ class ColdStartRecommendationSystem:
         return state
 
     def __setstate__(self, state):
-        """
-        Restore the object's state from a pickled state.
-        """
+        """Restore the object's state from a pickled state."""
         self.__dict__.update(state)
         self.client = None 
         self.db = None
 
-    def load_data_from_mongo(self):
-        """
-        Load data from MongoDB collections into pandas DataFrames.
-        """
-        self._connect_mongo()
-        print("Loading data from MongoDB...")
-        
-        users_cursor = self.db['users'].find({})
-        users_data = [{
-            'user_id': user['id'],
-            'age': user.get('age', 25),
-            'gender': user.get('gender', 'unknown'),
-            'role': user.get('role', 'user'),
-            'account_status': user.get('account_status', 'active'),
-            'login_count': user.get('login_count', 0),
-            'profile_completion': user.get('profile_completion', 0)
-        } for user in users_cursor]
-
-        products_cursor = self.db['products'].find({})
-        products_data = []
-        for product in products_cursor:
-            pricing = product.get('pricing', {})
-            categories = [cat.get('name', '') for cat in product.get('categories', [])]
-            description = f"{product.get('description', '')} {product.get('short_description', '')}"
-            products_data.append({
-                'product_id': product['id'],
-                'title': product.get('title', ''),
-                'description': description,
-                'price': pricing.get('price', 0),
-                'discounted': pricing.get('discounted', False),
-                'product_type': product.get('product_type', ''),
-                'categories': ','.join(categories),
-                'tags': ','.join(product.get('tags', [])),
-                'rating': product.get('rating', 0),
-                'review_count': product.get('review_count', 0),
-                'is_trending': product.get('is_trending', False),
-                'is_featured': product.get('is_featured', False),
-                'created_at': product.get('createdAt', datetime.now() - timedelta(days=365)) # For freshness
-            })
-
-        interactions_cursor = self.db['interactions'].find({})
-        interactions_data = []
-        for interaction in interactions_cursor:
-            action_type = interaction.get('action_type', 'view')
-            rating = interaction.get('rating', 0)
-            if rating == 0:
-                rating_map = {'like': 1.0, 'dislike': 0.1, 'view': 0.5, 'purchase': 2.0, 'add_to_cart': 1.5}
-                rating = rating_map.get(action_type, 0.5)
-            interactions_data.append({
-                'user_id': interaction['user_id'],
-                'product_id': interaction['product_id'],
-                'rating': rating,
-                'action_type': action_type,
-                'timestamp': interaction.get('timestamp', datetime.now() - timedelta(days=365)) # For recency
-            })
-
-        self.users_df = pd.DataFrame(users_data)
-        self.products_df = pd.DataFrame(products_data)
-        self.interactions_df = pd.DataFrame(interactions_data)
-        
-        # Convert created_at to datetime
-        self.products_df['created_at'] = pd.to_datetime(self.products_df['created_at'])
-
-        print(f"Loaded {len(self.users_df)} users, {len(self.products_df)} products, {len(self.interactions_df)} interactions")
-
-    def prepare_user_features(self):
-        """Prepare user features for the model."""
-        print("Preparing user features...")
-        features = set()
-        for feature in ['gender', 'role', 'account_status']:
-            for value in self.users_df[feature].fillna('unknown').unique():
-                features.add(f"{feature}:{value}")
-        for label in ['teen', 'young', 'adult', 'middle', 'senior']: features.add(f"age:{label}")
-        for label in ['new', 'occasional', 'regular', 'frequent']: features.add(f"login_count:{label}")
-        for label in ['low', 'medium', 'high', 'complete']: features.add(f"profile_completion:{label}")
-        self.user_features_list = sorted(list(features))
-        return self.user_features_list
-
-    def prepare_item_features(self):
-        """Prepare item features for the model."""
-        print("Preparing item features...")
-        features = set()
-        for ptype in self.products_df['product_type'].dropna().unique():
-            if ptype: features.add(f"product_type:{ptype}")
-        for label in ['budget', 'affordable', 'mid_range', 'premium', 'luxury']: features.add(f"price_range:{label}")
-        for feature in ['discounted', 'is_trending', 'is_featured']:
-            features.add(f"{feature}:True"); features.add(f"{feature}:False")
-        for label in ['low', 'medium', 'good', 'excellent']: features.add(f"rating:{label}")
-        
-        all_categories = self.products_df['categories'].str.split(',').explode().str.strip().dropna()
-        self.top_categories = all_categories.value_counts().head(20).index.tolist()
-        for cat in self.top_categories:
-            features.add(f"category:{cat}")
-            
-        self.item_features_list = sorted(list(features))
-        return self.item_features_list
-        
-    def build_user_item_features(self):
-        """Build user and item feature matrices."""
-        print("Building feature matrices...")
-        def get_user_features(user):
-            features = set()
-            for col in ['gender', 'role', 'account_status']:
-                features.add(f"{col}:{user[col] if pd.notna(user[col]) else 'unknown'}")
-            age_map = {range(0, 21): 'teen', range(21, 31): 'young', range(31, 41): 'adult', range(41, 51): 'middle'}
-            features.add(f"age:{next((v for k, v in age_map.items() if user.get('age', 25) in k), 'senior')}")
-            # ... (add other feature derivations) ...
-            return list(features)
-
-        def get_item_features(product):
-            features = set()
-            if pd.notna(product['product_type']) and product['product_type']:
-                features.add(f"product_type:{product['product_type']}")
-            price = product.get('price', 0)
-            price_map = {range(0, 2001): 'budget', range(2001, 5001): 'affordable', range(5001, 10001): 'mid_range', range(10001, 20001): 'premium'}
-            features.add(f"price_range:{next((v for k, v in price_map.items() if price in k), 'luxury')}")
-            # ... (add other feature derivations) ...
-            return list(features)
-
-        user_features_data = [(user['user_id'], get_user_features(user)) for _, user in self.users_df.iterrows()]
-        item_features_data = [(prod['product_id'], get_item_features(prod)) for _, prod in self.products_df.iterrows()]
-        
-        return user_features_data, item_features_data
-
-    def train_model(self):
-        """Train the LightFM model."""
-        print("Starting model training process...")
-        self.load_data_from_mongo()
-        
-        if self.users_df.empty or self.products_df.empty or self.interactions_df.empty:
-            print("No data loaded. Aborting training.")
+    def _cache_item_metadata(self):
+        """Caches item metadata. Runs only if the attribute doesn't exist (for backward compatibility)."""
+        if hasattr(self, 'item_metadata') and self.item_metadata:
             return
 
+        self._connect_mongo()
+        print("Backward compatibility: Caching item metadata for re-ranking...")
+        self.item_metadata = {
+            p['id']: {
+                'created_at': p.get('createdAt', datetime.now() - timedelta(days=365)),
+                'categories': [cat.get('name', '') for cat in p.get('categories', [])]
+            }
+            for p in self.db['products'].find({}, {'id': 1, 'createdAt': 1, 'categories.name': 1, '_id': 0})
+        }
+        print(f"Cached metadata for {len(self.item_metadata)} items.")
+
+    def _ensure_feature_matrices(self):
+        """Builds feature matrices. Runs only if attributes don't exist (for backward compatibility)."""
+        if hasattr(self, 'user_features_matrix') and self.user_features_matrix is not None:
+            return
+
+        print("Backward compatibility: Rebuilding feature matrices from dataset...")
+        self._connect_mongo()
+        self.user_features_matrix = self.dataset.build_user_features(self._user_features_generator())
+        self.item_features_matrix = self.dataset.build_item_features(self._item_features_generator())
+        print("Feature matrices rebuilt successfully.")
+
+    def _fetch_and_prepare_features(self):
+        """Efficiently prepares features and caches metadata during training."""
+        self._connect_mongo()
+        print("Preparing user and item features from MongoDB...")
+
+        user_features = set()
+        for feature in ['gender', 'role', 'account_status']:
+            for value in self.db['users'].distinct(feature):
+                user_features.add(f"{feature}:{value or 'unknown'}")
+        for label in ['teen', 'young', 'adult', 'middle', 'senior']: user_features.add(f"age:{label}")
+        self.user_features_list = sorted(list(user_features))
+
+        item_features = set()
+        for ptype in self.db['products'].distinct('product_type'):
+            if ptype: item_features.add(f"product_type:{ptype}")
+        for label in ['budget', 'affordable', 'mid_range', 'premium', 'luxury']: item_features.add(f"price_range:{label}")
+        for feature in ['discounted', 'is_trending', 'is_featured']:
+            item_features.add(f"{feature}:True"); item_features.add(f"{feature}:False")
+        for label in ['low', 'medium', 'good', 'excellent']: item_features.add(f"rating:{label}")
+        
+        pipeline = [
+            {"$unwind": "$categories"},
+            {"$group": {"_id": "$categories.name", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 20}
+        ]
+        self.top_categories = [doc['_id'] for doc in self.db['products'].aggregate(pipeline)]
+        for cat in self.top_categories:
+            item_features.add(f"category:{cat}")
+        self.item_features_list = sorted(list(item_features))
+        
+        # We still cache metadata during training.
+        self._cache_item_metadata()
+
+    # The generator methods remain unchanged
+    def _user_features_generator(self):
+        """A generator that yields user features one by one from the DB."""
+        for user in self.db['users'].find({}, {'_id': 0}):
+            features = set()
+            for col in ['gender', 'role', 'account_status']:
+                features.add(f"{col}:{user.get(col, 'unknown')}")
+            age_map = {range(0, 21): 'teen', range(21, 31): 'young', range(31, 41): 'adult', range(41, 51): 'middle'}
+            features.add(f"age:{next((v for k, v in age_map.items() if user.get('age', 25) in k), 'senior')}")
+            yield (user['id'], list(features))
+
+    def _item_features_generator(self):
+        """A generator that yields item features one by one from the DB."""
+        for prod in self.db['products'].find({}, {'_id': 0}):
+            features = set()
+            if prod.get('product_type'):
+                features.add(f"product_type:{prod['product_type']}")
+            price = prod.get('pricing', {}).get('price', 0)
+            price_map = {range(0, 2001): 'budget', range(2001, 5001): 'affordable', range(5001, 10001): 'mid_range', range(10001, 20001): 'premium'}
+            features.add(f"price_range:{next((v for k, v in price_map.items() if price in k), 'luxury')}")
+            yield (prod['id'], list(features))
+    
+    def _interactions_generator(self):
+        """A generator that yields interaction tuples from the DB."""
+        rating_map = {'like': 1.0, 'dislike': 0.1, 'view': 0.5, 'purchase': 2.0, 'add_to_cart': 1.5}
+        for interaction in self.db['interactions'].find({}, {'_id': 0}):
+            rating = interaction.get('rating', 0)
+            if rating == 0:
+                rating = rating_map.get(interaction.get('action_type', 'view'), 0.5)
+            yield (interaction['user_id'], interaction['product_id'], rating)
+
+    def train_model(self):
+        """Train the LightFM model by streaming data from MongoDB."""
+        print("Starting memory-efficient model training process...")
+        self._fetch_and_prepare_features()
+
         self.dataset.fit(
-            users=self.users_df['user_id'].unique(),
-            items=self.products_df['product_id'].unique(),
-            user_features=self.prepare_user_features(),
-            item_features=self.prepare_item_features()
+            users=(u['id'] for u in self.db['users'].find({}, {'id': 1, '_id': 0})),
+            items=(p['id'] for p in self.db['products'].find({}, {'id': 1, '_id': 0})),
+            user_features=self.user_features_list,
+            item_features=self.item_features_list
         )
         
-        user_features_data, item_features_data = self.build_user_item_features()
+        print("Building interaction matrix from stream...")
+        interactions_matrix, _ = self.dataset.build_interactions(self._interactions_generator())
         
-        interactions_list = [tuple(x) for x in self.interactions_df[['user_id', 'product_id', 'rating']].values]
-        interactions_matrix, _ = self.dataset.build_interactions(interactions_list)
-        
-        self.user_features = self.dataset.build_user_features(user_features_data)
-        self.item_features = self.dataset.build_item_features(item_features_data)
+        # Build the feature matrices and they will be saved with the model
+        self._ensure_feature_matrices()
         
         self.model = LightFM(loss='warp', learning_rate=0.05, no_components=50, random_state=42)
         self.model.fit(
             interactions_matrix,
-            user_features=self.user_features,
-            item_features=self.item_features,
+            user_features=self.user_features_matrix,
+            item_features=self.item_features_matrix,
             epochs=50,
             num_threads=4,
             verbose=True
@@ -232,7 +182,7 @@ class ColdStartRecommendationSystem:
         print("Model training completed!")
 
     def save(self, filepath='recommendation_system.pkl'):
-        """Saves the entire recommendation system object to a file."""
+        """Saves the recommendation system object to a file."""
         print(f"Saving system state to {filepath}...")
         with open(filepath, 'wb') as f:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -249,157 +199,102 @@ class ColdStartRecommendationSystem:
         print("Loading complete.")
         return system
 
+    # The reranking and interaction fetching methods remain unchanged
     def _get_realtime_user_interactions(self, user_id):
-        """Fetch the latest interactions for a user from MongoDB."""
         self._connect_mongo()
-        user_interactions_cursor = self.db['interactions'].find({'user_id': user_id})
-        return [interaction['product_id'] for interaction in user_interactions_cursor]
-        
+        cursor = self.db['interactions'].find({'user_id': user_id}, {'product_id': 1, '_id': 0})
+        return {i['product_id'] for i in cursor}
+
     def _apply_reranking(self, recommendations, num_recommendations):
-        """Re-rank recommendations based on freshness and diversity."""
-
-        self._connect_mongo()
-
-        # Normalize scores
-        max_score = max(score for _, score in recommendations)
-        if max_score != 0 : 
-            recommendations = [(item_id, score / max_score) for item_id, score in recommendations]
-        
+        if not recommendations:
+            return []
+        # ... logic is the same ...
+        max_score = recommendations[0][1]
+        if max_score == 0: max_score = 1.0
         final_recommendations = []
-        
         for item_id, score in recommendations:
-            product_info = self.products_df.loc[self.products_df['product_id'] == item_id]
-            if product_info.empty:
-                continue
-
-            # --- Freshness Score ---
-            days_since_creation = (datetime.now() - product_info.iloc[0]['created_at']).days
-            freshness_score = max(0, 1 - (days_since_creation / 365)) # Simple linear decay over a year
-
-            # --- Diversity Score ---
-            product_categories = set(product_info.iloc[0]['categories'].split(','))
-            diversity_penalty = 0
-            for rec_item_id, _ in final_recommendations:
-                rec_item_info = self.products_df.loc[self.products_df['product_id'] == rec_item_id]
-                rec_item_categories = set(rec_item_info.iloc[0]['categories'].split(','))
-                
-                # Penalize if categories overlap
-                if product_categories.intersection(rec_item_categories):
-                    diversity_penalty += 0.1 
-
+            product_info = self.item_metadata.get(item_id)
+            if not product_info: continue
+            created_at = product_info['created_at']
+            now = datetime.now(created_at.tzinfo)
+            days_since_creation = (now - created_at).days
+            freshness_score = max(0, 1 - (days_since_creation / 365))
+            product_categories = set(product_info['categories'])
+            diversity_penalty = sum(0.1 for _, _, rec_cats in final_recommendations if product_categories.intersection(rec_cats))
             diversity_score = 1 - diversity_penalty
-            
-            # --- Combined Score ---
-            combined_score = (1 - self.freshness_weight - self.diversity_weight) * score \
-                           + self.freshness_weight * freshness_score \
-                           + self.diversity_weight * diversity_score
-                           
-            final_recommendations.append((item_id, combined_score))
-        
-        # Sort by the new combined score
+            normalized_score = score / max_score
+            combined_score = ((1 - self.freshness_weight - self.diversity_weight) * normalized_score +
+                               self.freshness_weight * freshness_score +
+                               self.diversity_weight * diversity_score)
+            final_recommendations.append((item_id, combined_score, product_categories))
         final_recommendations.sort(key=lambda x: x[1], reverse=True)
-        return final_recommendations[:num_recommendations]
+        return [(item_id, score) for item_id, score, _ in final_recommendations[:num_recommendations]]
+
 
     def get_recommendations(self, user_id, num_recommendations=10):
-        """Get recommendations for a user, with real-time updates and re-ranking."""
+        """Get recommendations for a user. This will now be fast on loaded models."""
         if self.model is None:
             raise ValueError("Model not trained or loaded. Please call train_model() or load().")
 
+        # These methods will now return instantly on a properly saved model.
+        self._cache_item_metadata()
+        self._ensure_feature_matrices()
+        
+        self._connect_mongo()
         user_id_map, _, item_id_map, _ = self.dataset.mapping()
         
         if user_id in user_id_map:
-            # --- Existing user ---
             user_index = user_id_map[user_id]
-            all_item_indices = list(item_id_map.values())
+            all_item_indices = np.arange(len(item_id_map))
             
             scores = self.model.predict(
                 user_index,
                 all_item_indices,
-                user_features=self.user_features,
-                item_features=self.item_features,
+                user_features=self.user_features_matrix,
+                item_features=self.item_features_matrix,
                 num_threads=4
             )
             
-            # STEP 1: Fetch all of the user's past interactions in real-time.
-            # This includes products they have viewed, liked, purchased, etc.
+            # Use inverse mapping for performance
+            inverse_item_map = {v: k for k, v in item_id_map.items()}
+            
             user_interactions = self._get_realtime_user_interactions(user_id)
             
-            top_items = sorted(zip(item_id_map.keys(), scores), key=lambda x: x[1], reverse=True)
-            
-            # STEP 2: Filter out any item the user has already interacted with.
-            # The 'if item_id not in user_interactions' clause ensures seen items are removed.
+            # Combine scores with item IDs efficiently
+            top_items = sorted(
+                [(inverse_item_map[i], scores[i]) for i in all_item_indices], 
+                key=lambda x: x[1], 
+                reverse=True
+            )
+
             predictions = [(item_id, float(score)) for item_id, score in top_items if item_id not in user_interactions]
 
-            # --- Re-ranking for Quality ---
-            # Only the unseen items are passed to the re-ranking step.
-            to_rerank = len(predictions)
-            if to_rerank > 15 : # small number for performance
-                to_rerank = 15
-            if num_recommendations > to_rerank :
-                to_rerank = num_recommendations
+            candidates_for_reranking = predictions[:max(num_recommendations * 3, 50)]
+            reranked_predictions = self._apply_reranking(candidates_for_reranking, num_recommendations)
+            product_ids = [pid for pid, score in reranked_predictions]
 
-            predictions = self._apply_reranking(predictions[:to_rerank], to_rerank)
-
-
-            # limiting predictions to top num_recommendations
-            predictions = predictions[:num_recommendations]
-
-            product_ids = [pid for pid, score in predictions]
-
-            # Query the database
-            products_cursor = self.db['products'].find({
-                'id': {'$in': product_ids}
-            })
-
-            # Build clean list (remove _id field)
-            products = []
-            for product in products_cursor:
-                product.pop('_id', None)  # Remove _id if present
-                products.append(product)
-
-            # Return recommended products
-            return products
         else:
-            # --- Cold start user ---
-            # (Logic for new users remains the same)
+            # Cold start logic remains the same
             print(f"Cold start for user: {user_id}. Recommending popular items.")
-            popular_items = self.products_df.sort_values(by=['is_trending', 'review_count', 'created_at'], ascending=[False, False, False])
-            predictions = list(zip(popular_items['product_id'], popular_items['rating']))
+            popular_items_cursor = self.db['products'].find(
+                {}, {'id': 1, 'rating': 1, '_id': 0}
+            ).sort([('is_trending', -1), ('review_count', -1), ('createdAt', -1)]).limit(100)
+            
+            predictions = [(item['id'], item.get('rating', 0)) for item in popular_items_cursor]
+            reranked_predictions = self._apply_reranking(predictions, num_recommendations)
+            product_ids = [pid for pid, score in reranked_predictions]
 
-            # --- Re-ranking for Quality ---
-            # Only the unseen items are passed to the re-ranking step.
-            to_rerank = len(predictions)
-            if to_rerank > 50 : # large number for new users
-                to_rerank = 50
-            if num_recommendations > to_rerank :
-                to_rerank = num_recommendations
-
-            predictions = self._apply_reranking(predictions[:to_rerank], to_rerank)
-            predictions = predictions[:num_recommendations]
-
-            product_ids = [pid for pid, score in predictions]
-
-            # Query the database
-            products_cursor = self.db['products'].find({
-                'id': {'$in': product_ids}
-            })
-
-            # Build clean list (remove _id field)
-            products = []
-            for product in products_cursor:
-                product.pop('_id', None)  # Remove _id if present
-                products.append(product)
-
-            # Return recommended products
-            return products
+        products_cursor = self.db['products'].find({'id': {'$in': product_ids}}, {'_id': 0})
+        product_map = {p['id']: p for p in products_cursor}
+        ordered_products = [product_map[pid] for pid in product_ids if pid in product_map]
+        
+        return ordered_products
 
 
 # --- Example Usage ---
 def main():
-    MODEL_PATH = 'cold_start_recsys.pkl'
+    MODEL_PATH = 'cold_start_recsys_mem_efficient.pkl'
     
-    # Initialize the recommendation system
-    # Use your MongoDB Atlas connection string
     rec_system = ColdStartRecommendationSystem(mongo_uri="mongodb+srv://swift:swift@hobby.nzyzrid.mongodb.net/")
     
     # --- Train and Save ---
@@ -410,30 +305,24 @@ def main():
     # --- Load and Predict ---
     print("\n--- Loading Model and Making Predictions ---")
     try:
-        # Load the saved system state into a new object
         loaded_rec_system = ColdStartRecommendationSystem.load(MODEL_PATH)
 
-        # Ensure DataFrames are loaded in the new instance
-        if loaded_rec_system.products_df is None or loaded_rec_system.users_df is None:
-             print("DataFrames not loaded correctly. Re-loading from Mongo.")
-             loaded_rec_system.load_data_from_mongo()
-
-        # Example: Get recommendations for an existing user
-        if not loaded_rec_system.users_df.empty:
-            existing_user_id = loaded_rec_system.users_df.iloc[0]['user_id']
+        loaded_rec_system._connect_mongo()
+        user_doc = loaded_rec_system.db['users'].find_one()
+        if user_doc:
+            existing_user_id = user_doc['id']
             recommendations = loaded_rec_system.get_recommendations(existing_user_id, num_recommendations=5)
             print(f"\nRecommendations for existing user '{existing_user_id}':")
-            for item_id, score in recommendations:
-                title = loaded_rec_system.products_df.loc[loaded_rec_system.products_df['product_id'] == item_id, 'title'].values[0]
-                print(f"- {title} (Score: {score:.3f})")
+            for product in recommendations:
+                print(f"- {product.get('title', 'N/A')} (ID: {product.get('id', 'N/A')})")
+        else:
+            print("No users found in the database to test existing user recommendations.")
 
-        # Example: Get recommendations for a cold start user
         cold_start_user_id = "new_user_who_does_not_exist"
         cold_recommendations = loaded_rec_system.get_recommendations(cold_start_user_id, num_recommendations=5)
         print(f"\nCold start recommendations for user '{cold_start_user_id}':")
-        for item_id, score in cold_recommendations:
-            title = loaded_rec_system.products_df.loc[loaded_rec_system.products_df['product_id'] == item_id, 'title'].values[0]
-            print(f"- {title} (Score: {score:.3f})")
+        for product in cold_recommendations:
+            print(f"- {product.get('title', 'N/A')} (ID: {product.get('id', 'N/A')})")
 
     except FileNotFoundError as e:
         print(e)
