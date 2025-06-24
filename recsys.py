@@ -230,19 +230,86 @@ class ColdStartRecommendationSystem:
         final_recommendations.sort(key=lambda x: x[1], reverse=True)
         return [(item_id, score) for item_id, score, _ in final_recommendations[:num_recommendations]]
 
+    def _get_recommendations_for_warm_user(self, user_interactions, num_recommendations):
+        """
+        Handles the 'warm start' scenario. The user has interactions but is not in the trained model.
+        Generates recommendations by creating an inferred user profile from their interacted items.
+        """
+        print(f"Warm start for user. Generating recommendations based on {len(user_interactions)} interactions.")
+        
+        # 1. Get the mapping and the model's item embeddings
+        # We need the item_id_map to link product IDs to the model's internal indices.
+        _, _, item_id_map, _ = self.dataset.mapping()
+        _, item_embeddings = self.model.get_item_representations(features=self.item_features_matrix)
+
+        # 2. Find the indices for the items the user has interacted with
+        interacted_item_indices = [item_id_map[item_id] for item_id in user_interactions if item_id in item_id_map]
+
+        if not interacted_item_indices:
+            # This can happen if the user interacted with items that have since been removed or were not in training.
+            # We fall back to a standard cold start.
+            print("Warm start user's items not found in model. Falling back to cold start.")
+            return self._get_recommendations_for_cold_user(num_recommendations)
+
+        # 3. Create the user's inferred 'taste' vector by averaging the embeddings of items they've interacted with.
+        inferred_user_embedding = np.mean(item_embeddings[interacted_item_indices], axis=0)
+
+        # 4. Calculate scores for all items by taking the dot product of the inferred user vector and all item embeddings.
+        all_scores = np.dot(item_embeddings, inferred_user_embedding)
+
+        # 5. Get top items, excluding those already interacted with
+        # Use the pre-calculated inverse map for efficiency
+        top_indices = np.argsort(all_scores)[::-1]
+        
+        # We should have this pre-calculated now, but just in case.
+        if not hasattr(self, 'inverse_item_map'):
+            self.inverse_item_map = {v: k for k, v in item_id_map.items()}
+            
+        predictions = []
+        for index in top_indices:
+            item_id = self.inverse_item_map[index]
+            if item_id not in user_interactions:
+                predictions.append((item_id, float(all_scores[index])))
+            if len(predictions) >= max(num_recommendations * 3, 50):
+                break
+                
+        # Apply the same re-ranking logic for diversity, freshness etc.
+        reranked_predictions = self._apply_reranking(predictions, num_recommendations)
+        product_ids = [pid for pid, score in reranked_predictions]
+        
+        return product_ids
+
+    # Optional: Refactor the cold-start logic into its own method for clarity
+    def _get_recommendations_for_cold_user(self, num_recommendations):
+        """
+        Handles the true 'cold start' scenario for users with no interactions.
+        """
+        print(f"True cold start. Recommending popular items.")
+        popular_items_cursor = self.db['products'].find(
+            {}, {'id': 1, 'rating': 1, '_id': 0}
+        ).sort([('is_trending', -1), ('review_count', -1), ('createdAt', -1)]).limit(100)
+        
+        predictions = [(item['id'], item.get('rating', 0)) for item in popular_items_cursor]
+        reranked_predictions = self._apply_reranking(predictions, num_recommendations)
+        product_ids = [pid for pid, score in reranked_predictions]
+        return product_ids
+
+    # This is the MODIFIED get_recommendations function
 
     def get_recommendations(self, user_id, num_recommendations=10):
-        """Get recommendations for a user. This will now be fast on loaded models."""
+        """
+        Get recommendations for a user. Handles Hot, Warm, and Cold start scenarios.
+        """
         if self.model is None:
             raise ValueError("Model not trained or loaded. Please call train_model() or load().")
 
-        # These methods will now return instantly on a properly saved model.
         self._cache_item_metadata()
         self._ensure_feature_matrices()
+        self._connect_mongo() # Connect once at the beginning
         
-        self._connect_mongo()
         user_id_map, _, item_id_map, _ = self.dataset.mapping()
-        
+
+        # --- HOT START: User is in the trained model ---
         if user_id in user_id_map:
             user_index = user_id_map[user_id]
             all_item_indices = np.arange(len(item_id_map))
@@ -254,15 +321,15 @@ class ColdStartRecommendationSystem:
                 item_features=self.item_features_matrix,
                 num_threads=4
             )
+
             
-            # Use inverse mapping for performance
-            inverse_item_map = {v: k for k, v in item_id_map.items()}
-            
+            if not hasattr(self, 'inverse_item_map'):
+                self.inverse_item_map = {v: k for k, v in item_id_map.items()}
+
             user_interactions = self._get_realtime_user_interactions(user_id)
             
-            # Combine scores with item IDs efficiently
             top_items = sorted(
-                [(inverse_item_map[i], scores[i]) for i in all_item_indices], 
+                [(self.inverse_item_map[i], scores[i]) for i in all_item_indices], 
                 key=lambda x: x[1], 
                 reverse=True
             )
@@ -273,16 +340,20 @@ class ColdStartRecommendationSystem:
             reranked_predictions = self._apply_reranking(candidates_for_reranking, num_recommendations)
             product_ids = [pid for pid, score in reranked_predictions]
 
+        # --- WARM/COLD START: User is NOT in the trained model ---
         else:
-            # Cold start logic remains the same
-            print(f"Cold start for user: {user_id}. Recommending popular items.")
-            popular_items_cursor = self.db['products'].find(
-                {}, {'id': 1, 'rating': 1, '_id': 0}
-            ).sort([('is_trending', -1), ('review_count', -1), ('createdAt', -1)]).limit(100)
-            
-            predictions = [(item['id'], item.get('rating', 0)) for item in popular_items_cursor]
-            reranked_predictions = self._apply_reranking(predictions, num_recommendations)
-            product_ids = [pid for pid, score in reranked_predictions]
+            # Check if this "unknown" user has any interactions in the DB
+            user_interactions = self._get_realtime_user_interactions(user_id)
+            if user_interactions:
+                # WARM START: User has interactions, so we can infer their preferences
+                product_ids = self._get_recommendations_for_warm_user(user_interactions, num_recommendations)
+            else:
+                # TRUE COLD START: User has no interactions, recommend popular items
+                product_ids = self._get_recommendations_for_cold_user(num_recommendations)
+
+        # --- Final Step: Fetch product details for the recommended IDs ---
+        if not product_ids:
+            return []
 
         products_cursor = self.db['products'].find({'id': {'$in': product_ids}}, {'_id': 0})
         product_map = {p['id']: p for p in products_cursor}
